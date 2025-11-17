@@ -1,104 +1,94 @@
-#!/usr/bin/env python3
-from picamera2 import Picamera2
-from ultralytics import YOLO
+from flask import Flask, Response
 import cv2
+from ultralytics import YOLO
 import time
-import os
-import numpy as np
 
-# ===== YOLO 객체인식 (집 안 객체 전용) =====
-IMG_SIZE = (320, 240)
-CONF_TH = 0.3
-IOU_TH = 0.45
-SAVE_DIR = "/home/user/detected"
-SAVE_INTERVAL = 1.0  # 초 단위 저장 주기
+app = Flask(__name__)
 
-# 집 안에서 관찰 가능한 객체 클래스
-ALLOWED_NAME = {
-    "person", "cat", "dog", "bottle", "cup", "bowl", "chair", "couch", "bed",
-    "tv", "laptop", "mouse", "keyboard", "cell phone", "book", "clock",
-    "toilet", "potted plant", "dining table", "refrigerator", "microwave",
-    "oven", "toaster", "sink", "remote", "vase", "teddy bear", "hair drier",
-    "toothbrush", "fork", "knife", "spoon", "wine glass", "cake", "pizza",
-    "carrot", "apple", "banana", "broccoli", "orange", "handbag", "suitcase",
-    "backpack", "umbrella"
-}
+# YOLOv8 모델 로컬 경로 (네 파일 경로로 맞춰!)
+MODEL_PATH = "/home/mj/yolov8n.pt"
+model = YOLO(MODEL_PATH)
 
-def main():
-    # YOLOv8 모델 로드
-    model_path = "/home/user/yolov8n.pt"
-    if not os.path.exists(model_path):
-        print("YOLOv8n 모델 다운로드 중...")
-        os.system(f"wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt -O {model_path}")
-    model = YOLO(model_path)
-    names = model.model.names if hasattr(model.model, "names") else None
+CAM_INDEX = 0  # USB 카메라 번호
 
-    # 허용 클래스 이름을 ID로 변환
-    allowed_ids = set()
-    if names:
-        inv = {str(v).lower(): k for k, v in names.items()} if isinstance(names, dict) else {v.lower(): i for i, v in enumerate(names)}
-        for n in ALLOWED_NAME:
-            if n in inv:
-                allowed_ids.add(inv[n])
-    print(f"허용된 클래스 수: {len(allowed_ids)}개")
+# 프레임 간 YOLO 추론 간격 (4프레임마다 1번 YOLO → 속도 대폭 증가)
+YOLO_INTERVAL = 4
 
-    # 저장 폴더 준비
-    os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # 카메라 설정
-    cam = Picamera2()
-    cam.configure(cam.create_video_configuration(main={"size": IMG_SIZE, "format": "RGB888"}))
-    cam.start()
-    time.sleep(0.2)
+def generate():
+    cap = cv2.VideoCapture(CAM_INDEX)
 
-    print("YOLO 객체 인식 (집 안 객체 전용) 시작")
+    # 카메라 캡처 성능 최적화
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    last_save = 0
-    frame_id = 0
+    if not cap.isOpened():
+        print("❌ ERROR: Cannot open camera")
+        return
 
-    try:
-        while True:
-            frame = cam.capture_array()  # RGB 포맷
-            result = model.predict(frame, imgsz=max(IMG_SIZE), conf=CONF_TH, iou=IOU_TH, verbose=False)
-            boxes = result[0].boxes
-            vis = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    print("⚡ YOLOv8 Fast Stream Started")
 
-            # 감지 및 필터링
-            if boxes is not None and boxes.xyxy.numel() > 0:
-                xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
-                cls = boxes.cls.cpu().numpy().astype(np.int32)
-                conf = boxes.conf.cpu().numpy().astype(np.float32)
+    frame_count = 0
+    last_result = None  # 최근 YOLO 결과 저장
 
-                for i, box in enumerate(xyxy):
-                    if cls[i] not in allowed_ids:
-                        continue
-                    x1, y1, x2, y2 = map(int, box)
-                    label = f"{names[cls[i]] if names else cls[i]} {conf[i]:.2f}"
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(vis, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
 
-            # 화면 표시
-            cv2.imshow("YOLOv8 Indoor Object Detection", vis)
+        # ---- YOLO 추론 (4프레임마다 1번만 실행) ----
+        if frame_count % YOLO_INTERVAL == 0:
+            # YOLO는 작은 해상도로 넣으면 속도 ↑
+            small = cv2.resize(frame, (320, 320))
 
-            # 이미지 저장
-            now = time.time()
-            if now - last_save > SAVE_INTERVAL:
-                timestamp = time.strftime("%Y%m%d-%H%M%S")
-                save_path = os.path.join(SAVE_DIR, f"{timestamp}_{frame_id:06d}.jpg")
-                cv2.imwrite(save_path, vis)
-                print(f"감지 이미지 저장됨: {save_path}")
-                last_save = now
+            results = model(small, stream=True)
 
-            frame_id += 1
+            for r in results:
+                last_result = r  # 최신 결과 덮어쓰기
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        # YOLO 결과를 현재 프레임에 그리기
+        if last_result is not None:
+            annotated = last_result.plot()
+            annotated = cv2.resize(annotated, (640, 480))
+        else:
+            annotated = frame
 
-    finally:
-        cam.stop()
-        cv2.destroyAllWindows()
-        print("프로그램 종료")
+        # JPEG 인코딩 (quality 낮추면 스트리밍 더 빨라짐)
+        ret, jpeg = cv2.imencode(".jpg", annotated, [
+            int(cv2.IMWRITE_JPEG_QUALITY), 70  # 품질 70%
+        ])
+
+        if not ret:
+            continue
+
+        # ---- 브라우저 스트리밍 ----
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" +
+               jpeg.tobytes() +
+               b"\r\n")
+
+        frame_count += 1
+
+    cap.release()
+
+
+@app.route("/video")
+def video():
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/")
+def index():
+    return """
+    <h1>⚡ YOLOv8 Real-Time Stream (Optimized)</h1>
+    <img src="/video" width="640">
+    """
+
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=5000, debug=False)
